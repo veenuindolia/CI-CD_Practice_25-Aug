@@ -4,7 +4,7 @@ prgs = {
     location = "centralindia"
   }
   rg2 = {
-    name     = "Pre-Prod_RG3"
+    name     = "Pre-Prod_RG2"
     location = "centralindia"
   }
 }
