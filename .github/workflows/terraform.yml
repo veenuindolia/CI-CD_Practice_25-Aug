@@ -1,0 +1,338 @@
+name: Terraform Azure Deployment
+
+on:
+  push:
+    branches:
+      - "feature**"
+      - main
+
+#   pull_request:
+#     branches:
+#       - main
+
+permissions:
+  contents: read
+  security-events: write
+
+jobs:
+
+  # =========================================================
+  # TERRAFORM SECURITY + PLAN
+  # =========================================================
+
+  terraform-plan:
+    name: Terraform Security & Plan
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+
+      # =====================================================
+      # SECRET SCANNING
+      # =====================================================
+
+      - name: Install Gitleaks
+        shell: bash
+        run: |
+          set -e
+
+          DOWNLOAD_URL=$(curl -sSL \
+            https://api.github.com/repos/gitleaks/gitleaks/releases/latest |
+            jq -r '.assets[] |
+              select(.name | contains("linux_x64")) |
+              select(.name | endswith(".tar.gz")) |
+              .browser_download_url')
+
+          echo "Downloading Gitleaks from:"
+          echo "$DOWNLOAD_URL"
+
+          curl -sSLO "$DOWNLOAD_URL"
+
+          FILE_NAME=$(basename "$DOWNLOAD_URL")
+
+          tar -xzf "$FILE_NAME"
+
+          sudo mv gitleaks /usr/local/bin/gitleaks
+
+          rm -f "$FILE_NAME"
+
+          echo "Installed Gitleaks:"
+          gitleaks version
+
+      - name: Run Gitleaks
+        id: gitleaks
+        continue-on-error: true
+        run: |
+           gitleaks dir . \
+            --verbose \
+            --redact \
+            --report-format sarif \
+            --report-path gitleaks-report.sarif \
+            --exit-code 1 \
+            .
+
+      - name: Upload Gitleaks Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gitleaks-report
+          path: gitleaks-report.sarif
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload Gitleaks SARIF to GitHub Code Scanning
+        if: always() && hashFiles('gitleaks-report.sarif') != ''
+        uses: github/codeql-action/upload-sarif@v4
+        with:
+          sarif_file: gitleaks-report.sarif
+          category: gitleaks   
+          
+      - name: Show Gitleaks Finding Summary
+        if: always()
+        run: |
+          echo "===== GITLEAKS SUMMARY ====="
+
+          if [ -f gitleaks-report.sarif ]; then
+            echo "SARIF file found."
+
+            echo "Number of findings:"
+            jq '[.runs[].results[]] | length' gitleaks-report.sarif
+
+            echo ""
+            echo "Rules detected:"
+            jq -r '.runs[].results[] | .ruleId' gitleaks-report.sarif | sort | uniq -c
+
+            echo ""
+            echo "Affected files:"
+            jq -r '.runs[].results[] | .locations[]?.physicalLocation.artifactLocation.uri' \
+              gitleaks-report.sarif | sort -u
+          else
+            echo "SARIF file not found."
+          fi    
+
+      - name: Fail if Gitleaks Found Secrets
+        if: steps.gitleaks.outcome == 'failure'
+        run: exit 1
+
+      # =====================================================
+      # TERRAFORM SETUP
+      # =====================================================
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+
+      # =====================================================
+      # TERRAFORM INIT
+      # =====================================================
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: Environment/Pre-Prod
+
+
+      # =====================================================
+      # TERRAFORM FORMAT
+      # =====================================================
+
+      - name: Terraform Format Check
+        run: terraform fmt -check -recursive
+        working-directory: Environment/Pre-Prod
+
+
+      # =====================================================
+      # TERRAFORM VALIDATE
+      # =====================================================
+
+      - name: Terraform Validate
+        run: terraform validate
+        working-directory: Environment/Pre-Prod
+
+
+      # =====================================================
+      # TFLINT
+      # =====================================================
+
+      - name: Setup TFLint
+        uses: terraform-linters/setup-tflint@v4
+
+      - name: Initialize TFLint
+        run: tflint --init
+        working-directory: Environment/Pre-Prod
+
+      - name: Run TFLint
+        id: tflint
+        continue-on-error: true
+        working-directory: Environment/Pre-Prod
+        run: |
+          tflint --recursive --format json > tflint-report.json
+
+      - name: Upload TFLint Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tflint-report
+          path: Environment/Pre-Prod/tflint-report.json
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Fail if TFLint Failed
+        if: steps.tflint.outcome == 'failure'
+        run: exit 1
+
+      # =====================================================
+      # TFSEC - IaC SECURITY GATE
+      # =====================================================
+
+      - name: Run tfsec
+        id: tfsec
+        continue-on-error: true
+        working-directory: Environment/Pre-Prod
+        run: |
+          tfsec . \
+            --format sarif \
+            --out tfsec-report.sarif
+
+      - name: Upload tfsec Report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tfsec-report
+          path: Environment/Pre-Prod/tfsec-report.sarif
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Fail if tfsec Failed
+        if: steps.tfsec.outcome == 'failure'
+        run: exit 1
+
+
+      # =====================================================
+      # AZURE LOGIN
+      # TESTING ONLY - HARDCODED CREDENTIALS
+      # =====================================================
+
+      - name: Azure Login
+        uses: azure/login@v3
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+
+      # =====================================================
+      # TERRAFORM PLAN
+      # =====================================================
+
+      - name: Terraform Plan
+        id: plan
+        run: terraform plan -out=tfplan
+        working-directory: Environment/Pre-Prod
+
+      - name: Generate Terraform Plan JSON
+        if: steps.plan.outcome == 'success'
+        run: |
+          terraform show -json tfplan > plan.json
+        working-directory: Environment/Pre-Prod
+
+      - name: Generate Terraform Plan Text
+        if: steps.plan.outcome == 'success'
+        run: |
+          terraform show tfplan > plan.txt
+        working-directory: Environment/Pre-Prod  
+
+
+      # =====================================================
+      # SAVE PLAN
+      # =====================================================
+
+      - name: Upload Terraform Plan Artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: terraform-plan
+          path: |
+            Environment/Pre-Prod/tfplan
+            Environment/Pre-Prod/plan.json
+            Environment/Pre-Prod/plan.txt
+          if-no-files-found: warn
+          retention-days: 7
+
+
+  # =========================================================
+  # TERRAFORM APPLY
+  # =========================================================
+
+  terraform-apply:
+    name: Terraform Apply
+    runs-on: ubuntu-latest
+
+    needs: terraform-plan
+
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+
+    steps:
+
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+
+      # =====================================================
+      # TERRAFORM SETUP
+      # =====================================================
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+
+      # =====================================================
+      # AZURE LOGIN
+      # TESTING ONLY - HARDCODED CREDENTIALS
+      # =====================================================
+
+      - name: Azure Login
+        uses: azure/login@v3
+        with:
+          creds: |
+            {
+              "clientId": "${{ secrets.AZURE_CLIENT_ID }}",
+              "clientSecret": "${{ secrets.AZURE_CLIENT_SECRET }}",
+              "subscriptionId": "${{ secrets.AZURE_SUBSCRIPTION_ID }}",
+              "tenantId": "${{ secrets.AZURE_TENANT_ID }}"
+            }
+
+      # =====================================================
+      # TERRAFORM INIT
+      # =====================================================
+
+      - name: Terraform Init
+        run: terraform init
+        working-directory: Environment/Pre-Prod
+
+
+      # =====================================================
+      # DOWNLOAD PREVIOUS PLAN
+      # =====================================================
+
+      - name: Download Terraform Plan
+        uses: actions/download-artifact@v4
+        with:
+          name: terraform-plan
+          path: Environment/Pre-Prod
+
+
+      # =====================================================
+      # TERRAFORM APPLY
+      # =====================================================
+
+      - name: Terraform Appl
+        run: terraform apply -auto-approve tfplan
+        working-directory: Environment/Pre-Prod
